@@ -4,7 +4,7 @@ use rust_decimal::Decimal;
 
 use crate::ast::{BinaryOp, BinaryOperator, UnaryOp, UnaryOperator};
 use crate::error::QueryError;
-use rustledger_core::NaiveDate;
+use rustledger_core::{Amount, NaiveDate, Position};
 
 use super::Executor;
 use super::types::{DayCount, Interval, PostingContext, Value};
@@ -514,6 +514,84 @@ impl Executor<'_> {
         }
     }
 
+    /// ORDER BY's order for amounts: currency, then number, as beancount's
+    /// `amount.sortkey` orders them (#2445).
+    fn amount_order(a: &Amount, b: &Amount) -> std::cmp::Ordering {
+        a.currency
+            .as_str()
+            .cmp(b.currency.as_str())
+            .then_with(|| a.number.cmp(&b.number))
+    }
+
+    /// ORDER BY's order for positions: units currency, then cost number,
+    /// cost currency, and units number, a position with no cost counting as
+    /// cost `0` in `""`. That is beancount's `Position.sortkey`, whose first
+    /// key ranks the units currency: `USD`, `EUR`, `JPY`, `CAD`, `GBP`,
+    /// `AUD`, `NZD`, `CHF` first, in that order, so an operating currency sorts
+    /// before the commodities held against it. It ranks every other currency
+    /// by the LENGTH of its name, though its comment says alphabetical, so all
+    /// other currencies of one length tie and their positions interleave by
+    /// cost: `GLD` and `VHT` lots mixed. Those sort alphabetically here, a
+    /// deliberate divergence (#2445).
+    pub(super) fn position_order(a: &Position, b: &Position) -> std::cmp::Ordering {
+        fn cost(p: &Position) -> (Decimal, &str) {
+            p.cost
+                .as_ref()
+                .map_or((Decimal::ZERO, ""), |c| (c.number, c.currency.as_str()))
+        }
+        /// beancount's `CURRENCY_ORDER`, then the rest alphabetically.
+        fn rank(currency: &str) -> (usize, &str) {
+            const LISTED: [&str; 8] = ["USD", "EUR", "JPY", "CAD", "GBP", "AUD", "NZD", "CHF"];
+            LISTED
+                .iter()
+                .position(|listed| *listed == currency)
+                .map_or((LISTED.len(), currency), |i| (i, ""))
+        }
+        rank(a.units.currency.as_str())
+            .cmp(&rank(b.units.currency.as_str()))
+            .then_with(|| cost(a).cmp(&cost(b)))
+            .then_with(|| a.units.number.cmp(&b.units.number))
+    }
+
+    /// ORDER BY's order for inventories: each one's positions sorted in the
+    /// position order, then compared in turn, a shorter list that agrees so
+    /// far sorting first (so an empty inventory sorts first). That is
+    /// beancount's `Inventory.__lt__`, `sorted(self) < sorted(other)`, with
+    /// this file's position order. It compared their FIRST positions, in the
+    /// order the ledger added them, so a group's place depended on which of
+    /// its lots came first in the ledger (#2445).
+    fn inventory_order(
+        a: &rustledger_core::Inventory,
+        b: &rustledger_core::Inventory,
+    ) -> std::cmp::Ordering {
+        Self::position_lists_order(&Self::sorted_positions(a), &Self::sorted_positions(b))
+    }
+
+    /// An inventory's positions in the position order, leaving out those of
+    /// zero units: an inventory keeps a cost-less position that nets to zero
+    /// (#2378), which holds nothing, and beancount has none to sort.
+    pub(super) fn sorted_positions(inv: &rustledger_core::Inventory) -> Vec<&Position> {
+        let mut positions: Vec<&Position> = inv
+            .positions()
+            .filter(|p| !p.units.number.is_zero())
+            .collect();
+        positions.sort_by(|x, y| Self::position_order(x, y));
+        positions
+    }
+
+    /// Two sorted position lists compared in turn, a shorter list that agrees
+    /// so far sorting first: the inventory order, over positions sorted once.
+    pub(super) fn position_lists_order<P: std::borrow::Borrow<Position>>(
+        a: &[P],
+        b: &[P],
+    ) -> std::cmp::Ordering {
+        a.iter()
+            .zip(b)
+            .map(|(x, y)| Self::position_order(x.borrow(), y.borrow()))
+            .find(|ord| ord.is_ne())
+            .unwrap_or_else(|| a.len().cmp(&b.len()))
+    }
+
     /// Compare two values for sorting purposes.
     pub(super) fn compare_values_for_sort(
         &self,
@@ -535,21 +613,13 @@ impl Executor<'_> {
             (Value::String(a), Value::String(b)) => a.cmp(b),
             (Value::Date(a), Value::Date(b)) => a.cmp(b),
             (Value::Boolean(a), Value::Boolean(b)) => a.cmp(b),
-            // Compare amounts by their numeric value (same currency assumed)
-            (Value::Amount(a), Value::Amount(b)) => a.number.cmp(&b.number),
-            // Compare positions by their units' numeric value
-            (Value::Position(a), Value::Position(b)) => a.units.number.cmp(&b.units.number),
-            // Compare inventories by first position's value (for single-currency)
-            (Value::Inventory(a), Value::Inventory(b)) => {
-                let a_val = a.positions().next().map(|p| &p.units.number);
-                let b_val = b.positions().next().map(|p| &p.units.number);
-                match (a_val, b_val) {
-                    (Some(av), Some(bv)) => av.cmp(bv),
-                    (Some(_), None) => std::cmp::Ordering::Less,
-                    (None, Some(_)) => std::cmp::Ordering::Greater,
-                    (None, None) => std::cmp::Ordering::Equal,
-                }
-            }
+            // Amounts by currency, then number: beancount's `amount.sortkey`,
+            // and so bean-query's ORDER BY. By number alone, `5 USD` and
+            // `5 EUR` compared equal and one currency's values scattered
+            // through another's (#2445).
+            (Value::Amount(a), Value::Amount(b)) => Self::amount_order(a, b),
+            (Value::Position(a), Value::Position(b)) => Self::position_order(a, b),
+            (Value::Inventory(a), Value::Inventory(b)) => Self::inventory_order(a, b),
             // Compare intervals by approximate days
             (Value::Interval(a), Value::Interval(b)) => a.to_approx_days().cmp(&b.to_approx_days()),
             _ => std::cmp::Ordering::Equal, // Can't compare other types

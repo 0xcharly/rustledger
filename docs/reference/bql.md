@@ -199,6 +199,12 @@ ORDER BY year(date), month(date)
 ORDER BY sum(position) DESC
 ```
 
+Amounts sort by currency, then number, so each currency's values stay
+together: `-5.00 EUR`, `5.00 EUR`, `-5 USD`, `5 USD`. Positions sort by units
+currency (`USD`, `EUR`, `JPY`, `CAD`, `GBP`, `AUD`, `NZD`, `CHF` first, as in
+beancount, then the rest alphabetically), then cost, then units; an inventory
+by its positions sorted, compared in turn. NULL sorts first in ascending order.
+
 ## LIMIT Clause
 
 ```sql

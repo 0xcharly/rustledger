@@ -413,6 +413,39 @@ impl QueryResult {
         }
     }
 
+    /// Sort the rows by comparing their indices, keeping `row_group_keys` in
+    /// lockstep as [`Self::sort_by`] does. For a comparison that reads keys
+    /// prepared per row ahead of the sort rather than the rows themselves.
+    pub(crate) fn sort_by_row_index<F>(&mut self, mut compare: F)
+    where
+        F: FnMut(usize, usize) -> std::cmp::Ordering,
+    {
+        assert_eq!(
+            self.rows.len(),
+            self.row_group_keys.len(),
+            "QueryResult invariant violated: rows.len() must equal row_group_keys.len()"
+        );
+        let mut order: Vec<usize> = (0..self.rows.len()).collect();
+        order.sort_by(|&i, &j| compare(i, j));
+        let mut rows: Vec<Option<Row>> = std::mem::take(&mut self.rows)
+            .into_iter()
+            .map(Some)
+            .collect();
+        let mut keys: Vec<Option<Option<Vec<Value>>>> = std::mem::take(&mut self.row_group_keys)
+            .into_iter()
+            .map(Some)
+            .collect();
+        self.rows.reserve_exact(order.len());
+        self.row_group_keys.reserve_exact(order.len());
+        for i in order {
+            // `order` is a permutation of `0..n`, so each slot is taken once.
+            self.rows
+                .push(rows[i].take().expect("each row is taken once"));
+            self.row_group_keys
+                .push(keys[i].take().expect("each key is taken once"));
+        }
+    }
+
     /// Number of rows.
     pub const fn len(&self) -> usize {
         self.rows.len()
@@ -621,6 +654,38 @@ mod tests {
         assert_eq!(r.group_key(0), Some(&[Value::String("EUR".into())][..]));
         assert_eq!(r.group_key(1), Some(&[Value::String("GBP".into())][..]));
         assert_eq!(r.group_key(2), Some(&[Value::String("USD".into())][..]));
+    }
+
+    /// `sort_by_row_index` reorders rows AND `row_group_keys` together, as
+    /// `sort_by` does (#2445). Keys differ per row here, so a row paired with
+    /// another's key would show.
+    #[test]
+    fn test_sort_by_row_index_keeps_row_group_keys_in_lockstep() {
+        let mut r = make_keyed_result();
+        let amounts: Vec<i64> = r
+            .rows
+            .iter()
+            .map(|row| match row[1] {
+                Value::Integer(n) => n,
+                _ => panic!("the fixture's second column is an integer"),
+            })
+            .collect();
+        r.sort_by_row_index(|i, j| amounts[i].cmp(&amounts[j]));
+        assert_eq!(r.group_key(0), Some(&[Value::String("EUR".into())][..]));
+        assert_eq!(r.group_key(1), Some(&[Value::String("GBP".into())][..]));
+        assert_eq!(r.group_key(2), Some(&[Value::String("USD".into())][..]));
+        assert_eq!(r.rows[0][0], Value::String("EUR".into()));
+        assert_eq!(r.rows[2][0], Value::String("USD".into()));
+    }
+
+    /// `sort_by_row_index` refuses a result whose sidecar is out of step,
+    /// as `sort_by` does.
+    #[test]
+    #[should_panic(expected = "QueryResult invariant violated")]
+    fn test_sort_by_row_index_panics_on_lockstep_violation() {
+        let mut r = QueryResult::new(vec!["x".into()]);
+        r.rows.push(vec![Value::Integer(1)]);
+        r.sort_by_row_index(|_, _| std::cmp::Ordering::Equal);
     }
 
     /// `truncate` drops the same suffix from rows AND `row_group_keys`.
