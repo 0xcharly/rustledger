@@ -108,11 +108,15 @@ pub const DEFAULT_SANDBOX_MAX_TIME_SECS: u64 = 30;
 ///
 /// wasmtime charges roughly one unit of fuel per wasm operator, and
 /// Cranelift-compiled code runs several billion operators per second:
-/// 5-17 billion fuel per second measured on an x86-64 desktop, both
-/// for a tight arithmetic loop and for a plugin decoding its
-/// `PluginInput` (~67k fuel per two-posting transaction). At one
-/// billion, a budget of N seconds stops a call within N seconds of
-/// wall-clock time on any host running wasm at least that fast.
+/// 5-17 billion fuel per second measured on an x86-64 desktop for a
+/// tight arithmetic loop and for a plugin decoding its `PluginInput`
+/// (~67k fuel per two-posting transaction). An empty `(loop (br 0))`
+/// is the slowest per unit of fuel, since every iteration pays a fuel
+/// check: ~3.4 billion per second on an x86-64 server, so it exhausts
+/// the default 30-second budget in ~9 s. At one billion, a budget of N
+/// seconds stops a call within N seconds of wall-clock time on any
+/// host running wasm at least that fast; that margin is ~3x for a
+/// plugin written to burn time, not 5-17x.
 pub const FUEL_PER_SECOND: u64 = 1_000_000_000;
 
 /// Hard cap on the number of elements in any single WASM table.
