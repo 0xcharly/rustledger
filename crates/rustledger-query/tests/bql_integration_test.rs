@@ -10484,6 +10484,73 @@ fn test_open_meta_from_postings_table() {
     assert_eq!(result.rows[1][1], Value::Null);
 }
 
+/// `#entries.accounts` for a directive that is not a transaction: the same set
+/// beancount's `getters.get_entry_accounts` returns, which is what bean-query's
+/// column calls.
+fn entry_accounts(directive: Directive) -> Value {
+    let result = execute_query("SELECT accounts FROM #entries", &[directive]);
+    assert_eq!(result.rows.len(), 1);
+    result.rows[0][0].clone()
+}
+
+fn accounts(names: &[&str]) -> Value {
+    Value::StringSet(names.iter().map(ToString::to_string).collect())
+}
+
+#[test]
+fn test_entry_accounts_of_single_account_directives() {
+    let d = date(2024, 1, 1);
+    let cases = vec![
+        Directive::Open(Open::new(d, "Assets:Bank")),
+        Directive::Close(Close::new(d, "Assets:Bank")),
+        Directive::Balance(rustledger_core::Balance::new(
+            d,
+            "Assets:Bank",
+            Amount::new(dec!(10), "USD"),
+        )),
+        Directive::Note(Note::new(d, "Assets:Bank", "a note")),
+        Directive::Document(Document::new(d, "Assets:Bank", "/tmp/statement.pdf")),
+    ];
+    for directive in cases {
+        let kind = format!("{directive:?}");
+        assert_eq!(
+            entry_accounts(directive),
+            accounts(&["Assets:Bank"]),
+            "{kind}"
+        );
+    }
+}
+
+#[test]
+fn test_entry_accounts_of_pad_are_a_sorted_set() {
+    // The source sorts first, so source order and sorted order differ.
+    let pad = rustledger_core::Pad::new(date(2024, 1, 1), "Liabilities:Card", "Equity:Opening");
+    assert_eq!(
+        entry_accounts(Directive::Pad(pad)),
+        accounts(&["Equity:Opening", "Liabilities:Card"])
+    );
+
+    // beancount accepts a pad from an account to itself (it is only unused),
+    // and its set holds the account once.
+    let pad = rustledger_core::Pad::new(date(2024, 1, 1), "Assets:Bank", "Assets:Bank");
+    assert_eq!(
+        entry_accounts(Directive::Pad(pad)),
+        accounts(&["Assets:Bank"])
+    );
+}
+
+#[test]
+fn test_entry_accounts_of_accountless_directives_are_empty() {
+    let d = date(2024, 1, 1);
+    for directive in [
+        Directive::Commodity(Commodity::new(d, "USD")),
+        Directive::Event(Event::new(d, "location", "home")),
+    ] {
+        let kind = format!("{directive:?}");
+        assert_eq!(entry_accounts(directive), accounts(&[]), "{kind}");
+    }
+}
+
 #[test]
 fn test_entry_meta_from_postings_table() {
     let directives = vec![
